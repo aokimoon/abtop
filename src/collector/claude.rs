@@ -106,8 +106,7 @@ impl ClaudeCollector {
         }
 
         let self_pid = std::process::id();
-        let active_session_paths =
-            self.discover_active_session_paths(&shared.process_info, self_pid);
+        let active_session_paths = self.discover_active_session_paths(&shared.process_info, self_pid);
         let active_config_dirs: Vec<ConfigDir> = active_session_paths
             .iter()
             .map(|(_, config)| config.clone())
@@ -134,8 +133,7 @@ impl ClaudeCollector {
             }
         }
 
-        let discovery_ctx =
-            build_discovery_context(&session_paths, &shared.process_info, self_pid);
+        let discovery_ctx = build_discovery_context(&session_paths, &shared.process_info, self_pid);
 
         let mut sessions = self.load_session_paths(
             &session_paths,
@@ -233,10 +231,7 @@ impl ClaudeCollector {
     /// of abtop itself. Other users' non-interactive (`claude --print`)
     /// invocations are still surfaced — only abtop's own summary children
     /// are filtered out.
-    fn find_claude_pids(
-        process_info: &HashMap<u32, process::ProcInfo>,
-        self_pid: u32,
-    ) -> Vec<u32> {
+    fn find_claude_pids(process_info: &HashMap<u32, process::ProcInfo>, self_pid: u32) -> Vec<u32> {
         let mut pids = Vec::new();
         for (pid, info) in process_info {
             if !process::cmd_has_binary(&info.command, "claude") {

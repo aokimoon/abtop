@@ -217,11 +217,7 @@ pub fn get_children_map(procs: &HashMap<u32, ProcInfo>) -> HashMap<u32, Vec<u32>
 /// Used to identify processes spawned by abtop itself (e.g. `claude --print`
 /// summary children) so they can be filtered without dropping unrelated
 /// non-interactive sessions started by the user.
-pub fn is_descendant_of(
-    pid: u32,
-    ancestor: u32,
-    process_info: &HashMap<u32, ProcInfo>,
-) -> bool {
+pub fn is_descendant_of(pid: u32, ancestor: u32, process_info: &HashMap<u32, ProcInfo>) -> bool {
     if pid == 0 || ancestor == 0 || pid == ancestor {
         return false;
     }
