@@ -57,6 +57,8 @@ pub enum SessionStatus {
     Executing,
     /// Idle, waiting for user input or permission prompt
     Waiting,
+    /// Session appears recent, but process ownership is not confirmed
+    Unknown,
     /// Waiting due to rate limit
     RateLimited,
     /// Session finished

@@ -10,6 +10,8 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 #[cfg(all(not(target_os = "linux"), not(target_os = "windows")))]
 use std::process::Command;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 /// Collector for OpenAI Codex CLI sessions.
 ///
@@ -27,6 +29,7 @@ pub struct CodexCollector {
     sessions_dir: PathBuf,
     /// Latest rate limit info parsed from Codex JSONL token_count events.
     pub last_rate_limit: Option<RateLimitInfo>,
+    desktop_recent_scanner: DesktopRecentRolloutScanner,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +37,72 @@ struct CodexProcessContext {
     pid: Option<u32>,
     is_exec: bool,
     owns_process_tree: bool,
+    unknown_process_owner: bool,
+}
+
+struct DesktopRecentRolloutScanResult {
+    rollouts: Vec<PathBuf>,
+}
+
+struct DesktopRecentRolloutScanner {
+    cached: Vec<PathBuf>,
+    in_flight: bool,
+    last_started: Option<Instant>,
+    tx: Sender<DesktopRecentRolloutScanResult>,
+    rx: Receiver<DesktopRecentRolloutScanResult>,
+}
+
+const DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL: Duration = Duration::from_secs(60);
+
+impl DesktopRecentRolloutScanner {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            cached: Vec::new(),
+            in_flight: false,
+            last_started: None,
+            tx,
+            rx,
+        }
+    }
+
+    fn update(&mut self, sessions_dir: &Path, active_mtime_secs: u64) -> Vec<PathBuf> {
+        self.poll_completed();
+        if self.should_start(sessions_dir) {
+            self.start(sessions_dir.to_path_buf(), active_mtime_secs);
+        }
+        self.cached.clone()
+    }
+
+    fn poll_completed(&mut self) {
+        while let Ok(result) = self.rx.try_recv() {
+            self.cached = result.rollouts;
+            self.in_flight = false;
+        }
+    }
+
+    fn should_start(&self, sessions_dir: &Path) -> bool {
+        if self.in_flight || !sessions_dir.exists() {
+            return false;
+        }
+        self.last_started
+            .is_none_or(|started| started.elapsed() >= DESKTOP_RECENT_ROLLOUT_RESCAN_INTERVAL)
+    }
+
+    fn start(&mut self, sessions_dir: PathBuf, active_mtime_secs: u64) {
+        self.in_flight = true;
+        self.last_started = Some(Instant::now());
+        let tx = self.tx.clone();
+        std::thread::spawn(move || {
+            let rollouts = CodexCollector::recent_desktop_rollouts(
+                &sessions_dir,
+                &HashSet::new(),
+                &HashSet::new(),
+                active_mtime_secs,
+            );
+            let _ = tx.send(DesktopRecentRolloutScanResult { rollouts });
+        });
+    }
 }
 
 impl CodexCollector {
@@ -42,6 +111,7 @@ impl CodexCollector {
         Self {
             sessions_dir: home.join(".codex").join("sessions"),
             last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
         }
     }
 
@@ -74,6 +144,7 @@ impl CodexCollector {
                     pid: Some(*pid),
                     is_exec,
                     owns_process_tree: true,
+                    unknown_process_owner: false,
                 },
                 jsonl_path,
                 &shared.process_info,
@@ -99,39 +170,107 @@ impl CodexCollector {
             &shared.process_info,
             &shared.mcp_server_pids,
         );
-        let desktop_pid_to_rollouts = super::mcp::map_pid_to_rollouts(&desktop_pids);
+        if !desktop_pids.is_empty() {
+            let desktop_pid_to_rollouts: HashMap<u32, Vec<PathBuf>> = desktop_pids
+                .iter()
+                .filter_map(|pid| {
+                    shared
+                        .desktop_rollout_fd_map
+                        .get(pid)
+                        .map(|paths| (*pid, paths.clone()))
+                })
+                .collect();
 
-        // Codex Desktop app-server keeps old rollout fds open. Only fresh
-        // Desktop-originated rollouts represent currently active threads.
-        for (pid, path) in Self::active_desktop_rollouts(
-            desktop_pid_to_rollouts,
-            &seen_jsonl,
-            &shared.mcp_owned_rollouts,
-            super::mcp::ACTIVE_MTIME_SECS,
-        ) {
-            if let Some((session, rl)) = self.load_session_with_rate_limit(
-                CodexProcessContext {
-                    pid: Some(pid),
+            // Prefer the filesystem view so Desktop sessions appear immediately,
+            // then use the async fd cache only to improve PID ownership.
+            let desktop_pid_for_path = Self::desktop_pid_by_rollout_path(
+                &desktop_pid_to_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            );
+            let mut desktop_rollout_paths = Self::foreground_desktop_rollouts(
+                &self.sessions_dir,
+                &seen_jsonl,
+                &shared.mcp_owned_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            );
+            for path in self
+                .desktop_recent_scanner
+                .update(&self.sessions_dir, super::mcp::ACTIVE_MTIME_SECS)
+            {
+                if seen_jsonl.contains(&path) || shared.mcp_owned_rollouts.contains(&path) {
+                    continue;
+                }
+                if !desktop_rollout_paths.contains(&path) {
+                    desktop_rollout_paths.push(path);
+                }
+            }
+            Self::sort_rollouts_by_mtime_desc(&mut desktop_rollout_paths);
+
+            for path in desktop_rollout_paths {
+                let pid = desktop_pid_for_path
+                    .get(&path)
+                    .copied();
+                let process_ctx = CodexProcessContext {
+                    pid,
                     is_exec: false,
                     owns_process_tree: false,
-                },
-                &path,
-                &shared.process_info,
-                &shared.children_map,
-                &shared.ports,
-            ) {
-                seen_jsonl.insert(path);
-                if let Some(new_rl) = rl {
-                    let newer = self
-                        .last_rate_limit
-                        .as_ref()
-                        .is_none_or(|old| new_rl.updated_at > old.updated_at);
-                    if newer {
-                        super::rate_limit::write_codex_cache(&new_rl);
-                        self.last_rate_limit = Some(new_rl);
+                    unknown_process_owner: pid.is_none(),
+                };
+                if let Some((session, rl)) = self.load_session_with_rate_limit(
+                    process_ctx,
+                    &path,
+                    &shared.process_info,
+                    &shared.children_map,
+                    &shared.ports,
+                ) {
+                    seen_jsonl.insert(path);
+                    if let Some(new_rl) = rl {
+                        let newer = self
+                            .last_rate_limit
+                            .as_ref()
+                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
+                        if newer {
+                            super::rate_limit::write_codex_cache(&new_rl);
+                            self.last_rate_limit = Some(new_rl);
+                        }
                     }
+                    sessions.push(session);
                 }
-                sessions.push(session);
+            }
+
+            // Retain fd-only discovery for files not visible in today's active
+            // scan; this is a fallback, not the first-paint path.
+            for (pid, path) in Self::active_desktop_rollouts(
+                desktop_pid_to_rollouts,
+                &seen_jsonl,
+                &shared.mcp_owned_rollouts,
+                super::mcp::ACTIVE_MTIME_SECS,
+            ) {
+                if let Some((session, rl)) = self.load_session_with_rate_limit(
+                    CodexProcessContext {
+                        pid: Some(pid),
+                        is_exec: false,
+                        owns_process_tree: false,
+                        unknown_process_owner: false,
+                    },
+                    &path,
+                    &shared.process_info,
+                    &shared.children_map,
+                    &shared.ports,
+                ) {
+                    seen_jsonl.insert(path);
+                    if let Some(new_rl) = rl {
+                        let newer = self
+                            .last_rate_limit
+                            .as_ref()
+                            .is_none_or(|old| new_rl.updated_at > old.updated_at);
+                        if newer {
+                            super::rate_limit::write_codex_cache(&new_rl);
+                            self.last_rate_limit = Some(new_rl);
+                        }
+                    }
+                    sessions.push(session);
+                }
             }
         }
 
@@ -175,6 +314,7 @@ impl CodexCollector {
                             pid: None,
                             is_exec: false,
                             owns_process_tree: false,
+                            unknown_process_owner: false,
                         },
                         &path,
                         &shared.process_info,
@@ -262,6 +402,132 @@ impl CodexCollector {
             .collect()
     }
 
+    fn desktop_pid_by_rollout_path(
+        pid_to_rollouts: &HashMap<u32, Vec<PathBuf>>,
+        active_mtime_secs: u64,
+    ) -> HashMap<PathBuf, u32> {
+        Self::active_desktop_rollouts(
+            pid_to_rollouts.clone(),
+            &HashSet::new(),
+            &HashSet::new(),
+            active_mtime_secs,
+        )
+        .into_iter()
+        .map(|(pid, path)| (path, pid))
+        .collect()
+    }
+
+    fn foreground_desktop_rollouts(
+        sessions_dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let Some(today_dir) = Self::today_session_dir(sessions_dir) else {
+            return Vec::new();
+        };
+        let roots = [today_dir];
+        Self::recent_desktop_rollouts_from_roots(
+            &roots,
+            seen_jsonl,
+            mcp_owned_rollouts,
+            active_mtime_secs,
+        )
+    }
+
+    fn recent_desktop_rollouts_from_roots(
+        roots: &[PathBuf],
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        for root in roots {
+            Self::collect_recent_desktop_rollouts(
+                root,
+                seen_jsonl,
+                mcp_owned_rollouts,
+                active_mtime_secs,
+                &mut candidates,
+            );
+        }
+        Self::sort_rollouts_by_mtime_desc(&mut candidates);
+        candidates
+    }
+
+    fn recent_desktop_rollouts(
+        sessions_dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+    ) -> Vec<PathBuf> {
+        let mut candidates = Vec::new();
+        Self::collect_recent_desktop_rollouts(
+            sessions_dir,
+            seen_jsonl,
+            mcp_owned_rollouts,
+            active_mtime_secs,
+            &mut candidates,
+        );
+        Self::sort_rollouts_by_mtime_desc(&mut candidates);
+        candidates
+    }
+
+    fn sort_rollouts_by_mtime_desc(paths: &mut [PathBuf]) {
+        paths.sort_by_key(|path| {
+            std::cmp::Reverse(
+                fs::metadata(path)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH),
+            )
+        });
+    }
+
+    fn collect_recent_desktop_rollouts(
+        dir: &Path,
+        seen_jsonl: &HashSet<PathBuf>,
+        mcp_owned_rollouts: &HashSet<PathBuf>,
+        active_mtime_secs: u64,
+        candidates: &mut Vec<PathBuf>,
+    ) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                Self::collect_recent_desktop_rollouts(
+                    &path,
+                    seen_jsonl,
+                    mcp_owned_rollouts,
+                    active_mtime_secs,
+                    candidates,
+                );
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if seen_jsonl.contains(&path) || mcp_owned_rollouts.contains(&path) {
+                continue;
+            }
+            if Self::is_active_desktop_rollout(&path, active_mtime_secs) {
+                candidates.push(path);
+            }
+        }
+    }
+
     fn load_session_with_rate_limit(
         &self,
         process_ctx: CodexProcessContext,
@@ -292,7 +558,9 @@ impl CodexCollector {
         // Mirrors Claude: trust the trailing-event-is-user signal alone.
         // Codex tool outputs flow through response_item, not user_message,
         // so model_generating only flips on real prompts.
-        let status = if !pid_alive || (process_ctx.is_exec && result.task_complete) {
+        let status = if process_ctx.unknown_process_owner {
+            SessionStatus::Unknown
+        } else if !pid_alive || (process_ctx.is_exec && result.task_complete) {
             SessionStatus::Done
         } else {
             let has_active_child = process_ctx.owns_process_tree
@@ -313,6 +581,8 @@ impl CodexCollector {
         // For interactive sessions, task_complete fires after every turn — ignore it.
         let current_tasks = if !result.current_task.is_empty() {
             vec![result.current_task]
+        } else if matches!(status, SessionStatus::Unknown) {
+            vec!["unknown".to_string()]
         } else if !pid_alive || (process_ctx.is_exec && result.task_complete) {
             vec!["finished".to_string()]
         } else if matches!(status, SessionStatus::Waiting) {
@@ -396,7 +666,9 @@ impl CodexCollector {
                 thinking_since_ms: result.thinking_since_ms,
                 file_accesses: vec![],
                 config_root: super::abbrev_path(
-                    self.sessions_dir.parent().unwrap_or(std::path::Path::new(".")),
+                    self.sessions_dir
+                        .parent()
+                        .unwrap_or(std::path::Path::new(".")),
                 ),
             },
             rate_limit,
@@ -447,7 +719,7 @@ impl CodexCollector {
 
     /// Find Codex Desktop app-server host PIDs. Desktop is kept separate from
     /// CLI discovery because a single app-server PID can hold many rollout fds.
-    fn find_codex_desktop_pids_from_shared(
+    pub(crate) fn find_codex_desktop_pids_from_shared(
         process_info: &HashMap<u32, ProcInfo>,
         mcp_server_pids: &HashSet<u32>,
     ) -> Vec<u32> {
@@ -1177,6 +1449,7 @@ mod tests {
             pid: Some(pid),
             is_exec: false,
             owns_process_tree: true,
+            unknown_process_owner: false,
         }
     }
 
@@ -1185,6 +1458,7 @@ mod tests {
             pid: Some(pid),
             is_exec: false,
             owns_process_tree: false,
+            unknown_process_owner: false,
         }
     }
 
@@ -1350,6 +1624,60 @@ mod tests {
     }
 
     #[test]
+    fn recent_desktop_rollouts_include_active_sessions_from_older_day_dirs() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = CodexCollector::today_session_dir(sessions.path()).unwrap_or_else(|| {
+            let now = chrono::Local::now();
+            sessions
+                .path()
+                .join(now.format("%Y").to_string())
+                .join(now.format("%m").to_string())
+                .join(now.format("%d").to_string())
+        });
+        let older = sessions.path().join("2026").join("05").join("20");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&older).unwrap();
+        let active = today.join("rollout-active.jsonl");
+        let older_active = older.join("rollout-older-active.jsonl");
+        let stale = today.join("rollout-stale.jsonl");
+        let cli = today.join("rollout-cli.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&older_active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        write_jsonl(&cli, &[SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+
+        let rollouts = CodexCollector::recent_desktop_rollouts(
+            sessions.path(),
+            &HashSet::new(),
+            &HashSet::new(),
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(rollouts.len(), 2);
+        assert!(rollouts.contains(&active));
+        assert!(rollouts.contains(&older_active));
+    }
+
+    #[test]
+    fn desktop_pid_by_rollout_path_uses_active_fd_cache_only_for_ownership() {
+        let temp = tempfile::tempdir().unwrap();
+        let active = temp.path().join("rollout-active.jsonl");
+        let stale = temp.path().join("rollout-stale.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+        write_jsonl(&stale, &[DESKTOP_SESSION_META]);
+        set_modified(&stale, SystemTime::now() - Duration::from_secs(31 * 60));
+        let pid_to_rollouts = HashMap::from([(99, vec![active.clone(), stale])]);
+
+        let by_path = CodexCollector::desktop_pid_by_rollout_path(
+            &pid_to_rollouts,
+            super::super::mcp::ACTIVE_MTIME_SECS,
+        );
+
+        assert_eq!(by_path, HashMap::from([(active, 99)]));
+    }
+
+    #[test]
     fn desktop_rollout_selection_loads_active_session_with_host_pid() {
         let temp = tempfile::tempdir().unwrap();
         let active = temp.path().join("rollout-active.jsonl");
@@ -1402,6 +1730,51 @@ mod tests {
         assert_eq!(sessions[0].status, SessionStatus::Waiting);
         assert_eq!(sessions[0].mem_mb, 0);
         assert!(sessions[0].children.is_empty());
+    }
+
+    #[test]
+    fn desktop_filesystem_only_rollout_is_unknown_without_fd_owner() {
+        let sessions = tempfile::tempdir().unwrap();
+        let today = sessions.path().join(
+            chrono::Local::now()
+                .format("%Y/%m/%d")
+                .to_string(),
+        );
+        fs::create_dir_all(&today).unwrap();
+        let active = today.join("rollout-active.jsonl");
+        write_jsonl(&active, &[DESKTOP_SESSION_META]);
+
+        let mut collector = CodexCollector {
+            sessions_dir: sessions.path().to_path_buf(),
+            last_rate_limit: None,
+            desktop_recent_scanner: DesktopRecentRolloutScanner::new(),
+        };
+        let mut shared = super::super::SharedProcessData {
+            process_info: HashMap::new(),
+            children_map: HashMap::new(),
+            ports: HashMap::new(),
+            slow_tick: false,
+            mcp_server_pids: HashSet::new(),
+            mcp_owned_rollouts: HashSet::new(),
+            mcp_suppress: true,
+            desktop_rollout_fd_map: HashMap::new(),
+        };
+        shared.process_info.insert(
+            99,
+            proc_info(
+                99,
+                1,
+                "/Applications/Codex.app/Contents/Resources/codex app-server --analytics-default-enabled",
+            ),
+        );
+
+        let sessions = collector.collect_sessions(&shared);
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 0);
+        assert_eq!(sessions[0].session_id, "desktop-123");
+        assert_eq!(sessions[0].status, SessionStatus::Unknown);
+        assert_eq!(sessions[0].current_tasks, vec!["unknown".to_string()]);
     }
 
     #[test]
