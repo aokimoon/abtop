@@ -150,6 +150,7 @@ pub(crate) fn draw_sessions_panel_active(
             crate::model::SessionStatus::Thinking => (t("sess.think"), theme.proc_misc),
             crate::model::SessionStatus::Executing => (t("sess.exec"), theme.hi_fg),
             crate::model::SessionStatus::Waiting => (t("sess.wait"), grad_at(&proc_grad, 50.0)),
+            crate::model::SessionStatus::Unknown => (t("sess.unknown"), theme.inactive_fg),
             crate::model::SessionStatus::RateLimited => (t("sess.rate"), theme.status_fg),
             crate::model::SessionStatus::Done => (t("sess.done"), theme.inactive_fg),
         };
@@ -1062,6 +1063,7 @@ fn draw_timeline(
             crate::model::SessionStatus::Thinking
                 | crate::model::SessionStatus::Executing
                 | crate::model::SessionStatus::Waiting
+                | crate::model::SessionStatus::Unknown
         );
     if tool_calls.is_empty() && !is_thinking {
         return;

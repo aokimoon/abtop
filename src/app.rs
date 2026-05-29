@@ -699,7 +699,7 @@ impl App {
             return;
         }
         let session = &self.sessions[self.selected];
-        if session.status == SessionStatus::Done {
+        if matches!(session.status, SessionStatus::Done | SessionStatus::Unknown) {
             return;
         }
 

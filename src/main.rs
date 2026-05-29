@@ -350,6 +350,7 @@ fn print_snapshot(app: &App) {
             model::SessionStatus::Thinking => "◉ Think",
             model::SessionStatus::Executing => "● Exec",
             model::SessionStatus::Waiting => "◌ Wait",
+            model::SessionStatus::Unknown => "? Unknown",
             model::SessionStatus::RateLimited => "⏳ Rate",
             model::SessionStatus::Done => "✓ Done",
         };
