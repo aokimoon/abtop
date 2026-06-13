@@ -34,7 +34,7 @@ impl OpenCodeCollector {
             .map(PathBuf::from)
             .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".local/share"));
         Self {
-            db_path: data_dir.join("opencode").join("opencode.db"),
+            db_path: data_dir.join("opencode").join("opencode-stable.db"),
             sqlite3_available: None,
             cached_db_sessions: Vec::new(),
         }
@@ -508,7 +508,7 @@ mod tests {
         let collector = OpenCodeCollector::new();
         let path_str = collector.db_path.to_string_lossy();
         assert!(path_str.contains("opencode"));
-        assert!(path_str.ends_with("opencode.db"));
+        assert!(path_str.ends_with("opencode-stable.db"));
     }
 
     #[test]
